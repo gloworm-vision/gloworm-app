@@ -1,7 +1,9 @@
 package pipeline
 
 import (
+	"image"
 	"image/color"
+	"sort"
 	"sync"
 
 	"gocv.io/x/gocv"
@@ -14,14 +16,14 @@ type HSV struct {
 }
 
 func (h HSV) scalar() gocv.Scalar {
-	return gocv.NewScalar(h.H, h.S, h.V, 0)
+	return gocv.Scalar{Val1: h.H, Val2: h.S, Val3: h.V}
 }
 
 type Config struct {
-	MinThresh      HSV     `json:"minThresh"`
-	MaxThresh      HSV     `json:"maxThresh"`
-	MinContourArea float64 `json:"minContourArea"`
-	MaxContourArea float64 `json:"maxContourArea"`
+	MinThresh  HSV     `json:"minThresh"`
+	MaxThresh  HSV     `json:"maxThresh"`
+	MinContour float64 `json:"minContour"`
+	MaxContour float64 `json:"maxContour"`
 }
 
 type Pipeline struct {
@@ -50,7 +52,32 @@ func (p *Pipeline) Config() Config {
 	return p.config
 }
 
-func (p *Pipeline) ProcessFrame(frame gocv.Mat, outFrame *gocv.Mat) []gocv.Point2f {
+type SortableContours [][]image.Point
+
+func (s SortableContours) Len() int      { return len(s) }
+func (s SortableContours) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+func (s SortableContours) Less(i, j int) bool {
+	if gocv.ContourArea(s[i]) < gocv.ContourArea(s[j]) {
+		return true
+	}
+
+	return false
+}
+
+func calculateCentroid(img gocv.Mat, contour []image.Point) image.Point {
+	mat := gocv.NewMatWithSize(img.Rows(), img.Cols(), gocv.MatTypeCV8U)
+	gocv.FillPoly(&mat, [][]image.Point{contour}, color.RGBA{R: 255, G: 255, B: 255, A: 255})
+
+	moments := gocv.Moments(mat, false)
+
+	x := int(moments["m10"] / moments["m00"])
+	y := int(moments["m01"] / moments["m00"])
+
+	return image.Point{X: x, Y: y}
+}
+
+func (p *Pipeline) ProcessFrame(frame gocv.Mat, outFrame *gocv.Mat) (image.Point, bool) {
 	c := p.Config()
 
 	frameHSV := gocv.NewMat()
@@ -61,16 +88,26 @@ func (p *Pipeline) ProcessFrame(frame gocv.Mat, outFrame *gocv.Mat) []gocv.Point
 	defer frameThresh.Close()
 	gocv.InRangeWithScalar(frameHSV, c.MinThresh.scalar(), c.MaxThresh.scalar(), &frameThresh)
 
-	contours := gocv.FindContours(frameThresh, gocv.RetrievalList, gocv.ChainApproxSimple)
+	filteredContours := make([][]image.Point, 0)
+	imageArea := float64(frameThresh.Rows() * frameThresh.Cols())
 
-	for contourIndex, contour := range contours {
+	for _, contour := range gocv.FindContours(frameThresh, gocv.RetrievalList, gocv.ChainApproxSimple) {
 		area := gocv.ContourArea(contour)
-		if area < c.MinContourArea || area > c.MaxContourArea {
+		if area < c.MinContour*imageArea || area > c.MaxContour*imageArea {
 			continue
 		}
 
-		gocv.DrawContours(outFrame, contours, contourIndex, color.RGBA{0xff, 0xff, 0xff, 0xff}, 2)
+		rect := gocv.MinAreaRect(contour)
+		gocv.Rectangle(outFrame, image.Rectangle{Min: rect.BoundingRect.Min, Max: rect.BoundingRect.Max}, color.RGBA{255, 255, 255, 255}, 2)
+
+		filteredContours = append(filteredContours, contour)
 	}
 
-	return []gocv.Point2f{{X: 1, Y: 2}}
+	sort.Sort(SortableContours(filteredContours))
+
+	if len(filteredContours) > 0 {
+		return calculateCentroid(frameThresh, filteredContours[0]), true
+	}
+
+	return image.Point{}, false
 }

@@ -22,17 +22,16 @@ type Server struct {
 	Pipeline *pipeline.Pipeline
 	Logger   *logrus.Logger
 
-	originalStream *mjpeg.Stream
-	pipelineStream *mjpeg.Stream
+	stream *mjpeg.Stream
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	s.originalStream = mjpeg.NewStream()
-	s.pipelineStream = mjpeg.NewStream()
+	s.stream = mjpeg.NewStream()
 
 	mux := http.NewServeMux()
-	mux.Handle("/streams/original", s.originalStream)
-	mux.Handle("/streams/pipeline", s.pipelineStream)
+
+	mux.Handle("/stream", s.stream)
+
 	mux.HandleFunc("/pipeline", s.pipelineSettings)
 
 	httpServer := &http.Server{
@@ -83,20 +82,16 @@ func (s *Server) runVision(ctx context.Context) error {
 				return errors.New("couldn't read from capture")
 			}
 
-			out := gocv.NewMatWithSize(frameBuffer.Rows(), frameBuffer.Cols(), frameBuffer.Type())
-			_ = s.Pipeline.ProcessFrame(frameBuffer, &out)
+			point, ok := s.Pipeline.ProcessFrame(frameBuffer, &frameBuffer)
 
-			origBytes, err := gocv.IMEncode(".jpg", frameBuffer)
+			s.Logger.Infof("point: %v, ok: %v", point, ok)
+
+			buf, err := gocv.IMEncode(".jpg", frameBuffer)
 			if err != nil {
 				return fmt.Errorf("encode original frame buffer: %w", err)
 			}
-			s.originalStream.UpdateJPEG(origBytes)
 
-			outBytes, err := gocv.IMEncode(".jpg", out)
-			if err != nil {
-				return fmt.Errorf("encode pipeline output buffer: %w", err)
-			}
-			s.pipelineStream.UpdateJPEG(outBytes)
+			s.stream.UpdateJPEG(buf)
 		}
 	}
 }

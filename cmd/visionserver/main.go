@@ -12,10 +12,10 @@ import (
 
 func main() {
 	pipelineConfig := pipeline.Config{
-		MinThresh:      pipeline.HSV{H: 5, S: 100, V: 0},
-		MaxThresh:      pipeline.HSV{H: 30, S: 255, V: 255},
-		MinContourArea: 10,
-		MaxContourArea: 100,
+		MinThresh:  pipeline.HSV{H: 28, S: 70, V: 90},
+		MaxThresh:  pipeline.HSV{H: 38, S: 255, V: 255},
+		MinContour: 0.01,
+		MaxContour: 0.5,
 	}
 
 	pipeline := pipeline.New(pipelineConfig)
