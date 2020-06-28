@@ -2,34 +2,28 @@ package main
 
 import (
 	"context"
-	"log"
 
-	"github.com/gloworm-vision/gloworm-app/internal/server"
-	"github.com/gloworm-vision/gloworm-app/pipeline"
+	"github.com/gloworm-vision/gloworm-app/server"
+	"github.com/gloworm-vision/gloworm-app/store"
 	"github.com/sirupsen/logrus"
 	"gocv.io/x/gocv"
 )
 
 func main() {
-	pipelineConfig := pipeline.Config{
-		MinThresh:  pipeline.HSV{H: 28, S: 70, V: 90},
-		MaxThresh:  pipeline.HSV{H: 38, S: 255, V: 255},
-		MinContour: 0.01,
-		MaxContour: 0.5,
-	}
-
-	pipeline := pipeline.New(pipelineConfig)
-
 	webcam, err := gocv.OpenVideoCapture(0)
 	if err != nil {
 		panic(err)
 	}
 	defer webcam.Close()
 
-	server := server.Server{Addr: ":8080", Capture: webcam, Pipeline: pipeline, Logger: logrus.New()}
+	store, err := store.OpenBBolt("store.db", 0666, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	server := server.Server{Addr: ":8080", Store: store, Capture: webcam, Logger: logrus.New()}
 
 	if err := server.Run(context.Background()); err != nil {
-		log.Println(err)
-		return
+		panic(err)
 	}
 }

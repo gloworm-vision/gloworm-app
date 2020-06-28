@@ -4,7 +4,6 @@ import (
 	"image"
 	"image/color"
 	"sort"
-	"sync"
 
 	"gocv.io/x/gocv"
 )
@@ -27,29 +26,13 @@ type Config struct {
 }
 
 type Pipeline struct {
-	mu     *sync.Mutex
-	config Config
+	Config Config
 }
 
-func New(config Config) *Pipeline {
-	return &Pipeline{
-		config: config,
-		mu:     new(sync.Mutex),
+func New(config Config) Pipeline {
+	return Pipeline{
+		Config: config,
 	}
-}
-
-func (p *Pipeline) SetConfig(config Config) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.config = config
-}
-
-func (p *Pipeline) Config() Config {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return p.config
 }
 
 type SortableContours [][]image.Point
@@ -77,23 +60,21 @@ func calculateCentroid(img gocv.Mat, contour []image.Point) image.Point {
 	return image.Point{X: x, Y: y}
 }
 
-func (p *Pipeline) ProcessFrame(frame gocv.Mat, outFrame *gocv.Mat) (image.Point, bool) {
-	c := p.Config()
-
+func (p Pipeline) ProcessFrame(frame gocv.Mat, outFrame *gocv.Mat) (image.Point, bool) {
 	frameHSV := gocv.NewMat()
 	defer frameHSV.Close()
 	gocv.CvtColor(frame, &frameHSV, gocv.ColorBGRToHSV)
 
 	frameThresh := gocv.NewMat()
 	defer frameThresh.Close()
-	gocv.InRangeWithScalar(frameHSV, c.MinThresh.scalar(), c.MaxThresh.scalar(), &frameThresh)
+	gocv.InRangeWithScalar(frameHSV, p.Config.MinThresh.scalar(), p.Config.MaxThresh.scalar(), &frameThresh)
 
 	filteredContours := make([][]image.Point, 0)
 	imageArea := float64(frameThresh.Rows() * frameThresh.Cols())
 
 	for _, contour := range gocv.FindContours(frameThresh, gocv.RetrievalList, gocv.ChainApproxSimple) {
 		area := gocv.ContourArea(contour)
-		if area < c.MinContour*imageArea || area > c.MaxContour*imageArea {
+		if area < p.Config.MinContour*imageArea || area > p.Config.MaxContour*imageArea {
 			continue
 		}
 

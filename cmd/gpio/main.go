@@ -7,7 +7,14 @@ import (
 )
 
 func main() {
-	gloworm, err := hardware.NewGloworm("localhost:8888", 30000)
+	config := hardware.Config{
+		Gloworm: &hardware.GlowormConfig{
+			PigpioAddr:   "localhost:8888",
+			PWMFrequency: 30000,
+		},
+	}
+
+	gloworm, err := hardware.New(config)
 	if err != nil {
 		panic(err)
 	}

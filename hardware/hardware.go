@@ -1,14 +1,35 @@
 package hardware
 
-// Hardware defines a common interface for hardware gloworm-app can run on
-//
+import "io"
+
+// New creates a hardware interface from the given configuration. This hardware
+// may or may not implement any functionality at all, see the Hardware interface
+// documentation for more details.
+func New(c Config) (Hardware, error) {
+	if c.Gloworm != nil {
+		return NewGloworm(*c.Gloworm)
+	}
+
+	// no hardware is valid hardware
+	return nil, nil
+}
+
+// Config holds configuration information for all of the supported gloworm-app
+// hardware. No more than one config should be specified (not null), but it is
+// valid for no config to be specified at all.
+type Config struct {
+	Gloworm *GlowormConfig
+}
+
+// Hardware defines a common interface for hardware gloworm-app can run on.
 // Because not all hardware has status LEDs, or LED cluster brightness control,
-// or even an LED cluster at all, this is a fairly minimal interface. Most of the
-// time this interface should be type asserted to a more specific interface. For
-// example, you can assert to the BinaryLight interface for binary LED cluster control,
-// or the DimmableLight interface for dimmable LED cluster control.
+// or even an LED cluster at all, this interface is just a closer and only specified
+// for documentation purposes. When specific hardware functionality is required
+// you should type assert to a more specific interface that describes that
+// functionality. For example, you can attempt an assertion to the BinaryLight
+// interface if you need binary control of the hardware LED cluster.
 type Hardware interface {
-	Name() string
+	io.Closer
 }
 
 // BinaryLight describes hardware with an LED cluster that can be toggled on/off
