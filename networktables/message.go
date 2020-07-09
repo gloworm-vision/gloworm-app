@@ -192,7 +192,7 @@ type ntEntryAssignment struct {
 }
 
 const (
-	createId uint16 = 0xFFFF
+	createID uint16 = 0xFFFF
 )
 
 func (ea *ntEntryAssignment) Decode(rd io.Reader) (int, error) {

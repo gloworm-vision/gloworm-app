@@ -1,7 +1,6 @@
 package networktables
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,90 +8,27 @@ import (
 	"os"
 	"sync"
 
-	badger "github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v2"
 	"github.com/sirupsen/logrus"
 )
 
-type ClientConfig struct {
+// Client is a networktables 3 client. It's zero value is usable for communicating with a local
+// networktables server at port 1735 with an in-memory store and logging disabled.
+type Client struct {
+	Store    Store
+	Logger   *logrus.Logger
 	Addr     string
 	Identity string
-}
 
-type Client struct {
-	Store  Store
-	Logger *logrus.Logger
-	Config ClientConfig
+	memoryStore *badgerDB
+	storeMu     sync.Mutex
 
 	conn   net.Conn
-	connMu *sync.Mutex
+	connMu sync.Mutex
 }
 
-func (c *Client) Open(ctx context.Context) error {
-	if c.Config.Addr == "" {
-		c.Config.Addr = ":1735"
-	}
-
-	if c.Config.Identity == "" {
-		hostname, err := os.Hostname()
-		if err == nil {
-			c.Config.Identity = hostname
-		} else {
-			c.Config.Identity = "networktables-go"
-		}
-	}
-
-	if c.Store == nil {
-		store, err := OpenBadgerDB(badger.DefaultOptions("").WithInMemory(true))
-		if err != nil {
-			return fmt.Errorf("no store was specified, tried to use badger in memory but got: %w", err)
-		}
-
-		c.Store = store
-	}
-
-	c.connMu = new(sync.Mutex)
-
-	return nil
-}
-
-func (c *Client) Close() error {
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
-
-	err := c.conn.Close()
-	c.conn = nil
-	return err
-}
-
-func (c *Client) getConn() (net.Conn, error) {
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
-
-	if c.conn == nil {
-		conn, err := net.Dial("tcp", c.Config.Addr)
-		if err != nil {
-			return nil, fmt.Errorf("couldn't dial into server: %w", err)
-		}
-
-		c.conn = conn
-
-		fmt.Println("starting handshake")
-
-		c.handshake()
-
-		fmt.Println("handshaked")
-
-		go func() {
-			c.listen()
-			c.connMu.Lock()
-			c.conn = nil
-			c.connMu.Unlock()
-		}()
-	}
-
-	return c.conn, nil
-}
-
+// Ping sends a keep alive to the server. If you need to keep the connection alive you
+// should call this function no more than once every 100ms.
 func (c *Client) Ping() error {
 	conn, err := c.getConn()
 	if err != nil {
@@ -107,66 +43,218 @@ func (c *Client) Ping() error {
 	return err
 }
 
-const newEntryID = 0xFFFF
-
-func (c *Client) Put(entry Entry) error {
-	id, seq, err := c.Store.GetIDSeq(entry.Name)
-	if err == nil { // todo: actually check for not found
-		update := ntEntryUpdate{
-			ID:             uint16(id),
-			SequenceNumber: uint16(seq) + 1,
-			EntryValue:     ntFromEntryValue(entry.Value),
-		}
-
-		if err := c.Store.UpdateSeq(id, seq+1); err != nil {
-			return fmt.Errorf("couldn't update sequence number: %w", err)
-		}
-
-		_ = update
-
-		// c.requests <- request{messageType: entryUpdateMessageType, data: &update}
-
-		return nil
+// UpdateValue updates the entry value for an existing entry with the given name, and
+// issues an entry value update to the server.
+func (c *Client) UpdateValue(name string, value EntryValue) error {
+	store, err := c.getStore()
+	if err != nil {
+		return fmt.Errorf("couldn't get underlying store: %w", err)
 	}
 
-	// assignment := assignmentFromEntry(newEntryID, entry)
-	// c.requests <- request{messageType: entryAssignmentMessageType, data: &assignment}
+	id, seq, err := store.GetIDSeq(name)
+	if err != nil { // todo: actually check for not found
+		return fmt.Errorf("unable to get existing entry (perhaps it hasn't been created yet): %w", err)
+	}
+
+	if err := store.UpdateValue(id, seq+1, value); err != nil {
+		return fmt.Errorf("couldn't update value: %w", err)
+	}
+
+	conn, err := c.getConn()
+	if err != nil {
+		return fmt.Errorf("unable to get connection to server: %w", err)
+	}
+
+	if err := writeEntryUpdate(conn, id, seq+1, value); err != nil {
+		return fmt.Errorf("unable to write entry value update to server: %w", err)
+	}
 
 	return nil
 }
 
-func (c *Client) Get(name string) (Entry, error) {
-	value, err := c.Store.GetByName(name)
+// UpdateOptions updates the entry options for an existing entry with the given name, and
+// issues an entry options update to the server.
+func (c *Client) UpdateOptions(name string, opt EntryOptions) error {
+	store, err := c.getStore()
 	if err != nil {
-		return Entry{}, fmt.Errorf("couldn't get entry by name: %w", err)
+		return fmt.Errorf("couldn't get underlying store: %w", err)
 	}
 
-	return value, nil
+	id, _, err := store.GetIDSeq(name)
+	if err != nil { // todo: actually check for not found
+		return fmt.Errorf("unable to get existing entry (perhaps it hasn't been created yet): %w", err)
+	}
+
+	if err := store.UpdateOptions(id, opt); err != nil {
+		return fmt.Errorf("couldn't update options: %w", err)
+	}
+
+	conn, err := c.getConn()
+	if err != nil {
+		return fmt.Errorf("unable to get connection to server: %w", err)
+	}
+
+	if err := writeEntryFlagsUpdate(conn, id, opt); err != nil {
+		return fmt.Errorf("unable to write entry options update to server: %w", err)
+	}
+
+	return nil
 }
 
+// Create tells the server to issue an entry assignment to all clients (including us)
+// for the given entry. It does not immediately create an entry in the underlying store,
+// and for this reason it's not guaranteed that the value will exist after this function
+// returns, so successive Puts may fail. It is only guaranteed that the create request
+// has been written to the server. This is unfortunately due to how the networktables
+// protocol works, because there is no way for us to know which entry assignment from the
+// server corresponds to our entry assignment.
+func (c *Client) Create(entry Entry) error {
+	conn, err := c.getConn()
+	if err != nil {
+		return fmt.Errorf("unable to get connection to server: %w", err)
+	}
+
+	if err := writeEntryAssignment(conn, entry); err != nil {
+		return fmt.Errorf("unable to write entry assignment to server: %w", err)
+	}
+
+	return nil
+}
+
+// Get returns an entry from the underlying store for the given name.
+func (c *Client) Get(name string) (Entry, error) {
+	store, err := c.getStore()
+	if err != nil {
+		return Entry{}, fmt.Errorf("couldn't get underlying store: %w", err)
+	}
+
+	entry, err := store.GetByName(name)
+	if err != nil {
+		return entry, fmt.Errorf("couldn't get entry by name: %w", err)
+	}
+
+	return entry, nil
+}
+
+// Delete deletes an entry from the underlying store and issues a delete request to the
+// server.
 func (c *Client) Delete(name string) error {
-	id, err := c.Store.DeleteByName(name)
+	store, err := c.getStore()
+	if err != nil {
+		return fmt.Errorf("couldn't get underlying store: %w", err)
+	}
+
+	id, err := store.DeleteByName(name)
 	if err != nil {
 		return fmt.Errorf("couldn't delete entry: %w", err)
 	}
-	_ = id
 
-	// c.requests <- request{messageType: entryDeleteMessageType, data: &ntEntryDelete{ID: uint16(id)}}
+	conn, err := c.getConn()
+	if err != nil {
+		return fmt.Errorf("unable to get connection to server: %w", err)
+	}
+
+	if err := writeDelete(conn, id); err != nil {
+		return fmt.Errorf("unable to write delete request to server: %w", err)
+	}
 
 	return nil
+}
+
+// Close closes the underlying connection if one exists.
+func (c *Client) Close() error {
+	c.storeMu.Lock()
+	defer c.storeMu.Unlock()
+	if c.memoryStore != nil {
+		_ = c.memoryStore.db.Close()
+	}
+
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+
+	var err error
+	if c.conn != nil {
+		err = c.conn.Close()
+	}
+	c.conn = nil
+	return err
+}
+
+func (c *Client) getStore() (Store, error) {
+	if c.Store != nil {
+		return c.Store, nil
+	}
+
+	c.storeMu.Lock()
+	defer c.storeMu.Unlock()
+
+	if c.memoryStore == nil {
+		db, err := badger.Open(badger.DefaultOptions("").WithInMemory(true).WithLogger(nil))
+		if err != nil {
+			return nil, fmt.Errorf("no store was specified, tried to use badger in memory but got: %w", err)
+		}
+
+		c.memoryStore = &badgerDB{db: db}
+	}
+
+	return c.memoryStore, nil
+}
+
+func (c *Client) getConn() (net.Conn, error) {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+
+	if c.conn == nil {
+		addr := c.Addr
+		if addr == "" {
+			addr = ":1735"
+		}
+
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't dial into server: %w", err)
+		}
+
+		c.conn = conn
+
+		c.handshake()
+
+		go func() {
+			c.listen()
+			c.connMu.Lock()
+			c.conn = nil
+			c.connMu.Unlock()
+		}()
+	}
+
+	return c.conn, nil
 }
 
 const protocolVersion = 0x0300
 
+// handshake callers should have a connMu lock acquired before calling handshake
 func (c *Client) handshake() error {
-	// handshake callers should have a connMu lock acquired
+	store, err := c.getStore()
+	if err != nil {
+		return fmt.Errorf("couldn't get underlying store: %w", err)
+	}
 
 	conn := c.conn
 
-	if c.Logger != nil {
-		c.Logger.Infof("identifying as %q to server at %q", c.Config.Identity, conn.RemoteAddr().String())
+	identity := c.Identity
+	if identity == "" {
+		hostname, err := os.Hostname()
+		if err == nil {
+			identity = hostname
+		} else {
+			identity = "networktables-go"
+		}
 	}
-	if err := writeClientHello(conn, protocolVersion, c.Config.Identity); err != nil {
+
+	if c.Logger != nil {
+		c.Logger.Infof("identifying as %q to server at %q", identity, conn.RemoteAddr().String())
+	}
+	if err := writeClientHello(conn, protocolVersion, identity); err != nil {
 		return fmt.Errorf("couldn't send client hello to server: %w", err)
 	}
 
@@ -184,7 +272,6 @@ func (c *Client) handshake() error {
 	// they're missing
 
 	var messageType ntMessageType
-	var assignment ntEntryAssignment
 	serverNames := make(map[string]struct{})
 
 	for {
@@ -198,11 +285,12 @@ func (c *Client) handshake() error {
 			return fmt.Errorf("server responded with unexpected message type %x instead of %x", messageType.Type, entryAssignmentMessageType)
 		}
 
+		var assignment ntEntryAssignment
 		if _, err := assignment.Decode(conn); err != nil {
 			return fmt.Errorf("couldn't decode assignment: %w", err)
 		}
 
-		if err := c.Store.Create(entryFromAssignment(assignment)); err != nil {
+		if err := store.Create(entryFromAssignment(assignment)); err != nil {
 			return fmt.Errorf("couldn't create server assignment %q: %w", assignment.ID, err)
 		}
 
@@ -213,7 +301,7 @@ func (c *Client) handshake() error {
 		c.Logger.Infof("saved %d entry assignments from server", len(serverNames))
 	}
 
-	clientNames, err := c.Store.GetNames()
+	clientNames, err := store.GetNames()
 	if err != nil {
 		return fmt.Errorf("couldn't get existing entry names from store: %w", err)
 	}
@@ -224,7 +312,7 @@ func (c *Client) handshake() error {
 			continue
 		}
 
-		entry, err := c.Store.GetByName(name)
+		entry, err := store.GetByName(name)
 		if err != nil {
 			return fmt.Errorf("couldn't get client entry %q: %w", name, err)
 		}
@@ -258,6 +346,10 @@ func (c *Client) listen() {
 	for {
 		select {
 		default:
+			if c.conn == nil {
+				return
+			}
+
 			err := c.handleResponse()
 			if errors.Is(err, io.EOF) {
 				if c.Logger != nil {
@@ -282,6 +374,11 @@ func (c *Client) handleResponse() error {
 		return fmt.Errorf("couldn't decode message type: %w", err)
 	}
 
+	store, err := c.getStore()
+	if err != nil {
+		return fmt.Errorf("couldn't get underlying store: %w", err)
+	}
+
 	switch messageType.Type {
 	case keepAliveMessageType:
 	case entryAssignmentMessageType:
@@ -291,7 +388,7 @@ func (c *Client) handleResponse() error {
 		}
 
 		entry := entryFromAssignment(assignment)
-		if err := c.Store.Create(entry); err != nil {
+		if err := store.Create(entry); err != nil {
 			return fmt.Errorf("couldn't create entry assignment: %w", err)
 		}
 
@@ -304,7 +401,7 @@ func (c *Client) handleResponse() error {
 			return fmt.Errorf("couldn't decode entry update: %w", err)
 		}
 
-		err := c.Store.UpdateValue(int(entryUpdate.ID), entryValueFromNt(entryUpdate.EntryValue, entryUpdate.SequenceNumber))
+		err := store.UpdateValue(int(entryUpdate.ID), int(entryUpdate.SequenceNumber), entryValueFromNt(entryUpdate.EntryValue))
 		if err != nil {
 			return fmt.Errorf("couldn't update entry: %w", err)
 		}
@@ -318,7 +415,7 @@ func (c *Client) handleResponse() error {
 			return fmt.Errorf("couldn't decode entry flags update: %w", err)
 		}
 
-		err := c.Store.UpdateOptions(int(flagsUpdate.ID), entryOptionsFromNt(flagsUpdate.EntryFlags))
+		err := store.UpdateOptions(int(flagsUpdate.ID), entryOptionsFromNt(flagsUpdate.EntryFlags))
 		if err != nil {
 			return fmt.Errorf("couldn't update options: %q", err)
 		}
@@ -332,7 +429,7 @@ func (c *Client) handleResponse() error {
 			return fmt.Errorf("couldn't decode entry flags update: %w", err)
 		}
 
-		if err := c.Store.Delete(int(delete.ID)); err != nil {
+		if err := store.Delete(int(delete.ID)); err != nil {
 			return fmt.Errorf("couldn't delete entry: %w", err)
 		}
 
@@ -346,7 +443,7 @@ func (c *Client) handleResponse() error {
 		}
 
 		if clear.Magic == clearAllEntriesMagic {
-			if err := c.Store.Clear(); err != nil {
+			if err := store.Clear(); err != nil {
 				return fmt.Errorf("unable to clear store: %w", err)
 			}
 		}
@@ -361,49 +458,6 @@ func (c *Client) handleResponse() error {
 	return nil
 }
 
-// type request struct {
-// 	messageType uint8
-// 	data        encoder
-// }
-
-// type encoder interface {
-// 	Encode(w io.Writer) (int, error)
-// }
-
-// func (c *Client) requestHandler(ctx context.Context) {
-// 	keepAlive := time.NewTicker(time.Millisecond * 1000)
-// 	defer keepAlive.Stop()
-
-// 	for {
-// 		select {
-// 		case request := <-c.requests:
-// 			t := ntMessageType{Type: request.messageType}
-// 			if _, err := t.Encode(c.conn); err != nil {
-// 				if c.Logger != nil {
-// 					c.Logger.Error("unable to encode message type: %w", err)
-// 					continue
-// 				}
-// 			}
-
-// 			if _, err := request.data.Encode(c.conn); err != nil {
-// 				if c.Logger != nil {
-// 					c.Logger.Error("unable to encode request: %w", err)
-// 				}
-// 			}
-// 		case <-keepAlive.C:
-// 			t := ntMessageType{Type: keepAliveMessageType}
-// 			if _, err := t.Encode(c.conn); err != nil {
-// 				if c.Logger != nil {
-// 					c.Logger.Error("unable to encode keep alive: %w", err)
-// 					continue
-// 				}
-// 			}
-// 		case <-ctx.Done():
-// 			return
-// 		}
-// 	}
-// }
-
 // these translation functions are pretty annoying, but I
 // think it's important to decouple networktables entries
 // from our native entries
@@ -414,7 +468,7 @@ func entryFromAssignment(nt ntEntryAssignment) Entry {
 		SequenceNumber: int(nt.SequenceNumber),
 		Name:           nt.Name,
 		Options:        entryOptionsFromNt(nt.EntryFlags),
-		Value:          entryValueFromNt(nt.EntryValue, nt.SequenceNumber),
+		Value:          entryValueFromNt(nt.EntryValue),
 	}
 }
 
@@ -436,7 +490,13 @@ func entryOptionsFromNt(nt ntEntryFlags) EntryOptions {
 	}
 }
 
-func entryValueFromNt(nt ntEntryValue, seq uint16) EntryValue {
+func ntFromEntryOptions(nt EntryOptions) ntEntryFlags {
+	return ntEntryFlags{
+		Persist: nt.Persist,
+	}
+}
+
+func entryValueFromNt(nt ntEntryValue) EntryValue {
 	return EntryValue{
 		EntryType:    entryTypeFromNt(nt.Type),
 		Boolean:      nt.BooleanValue,
@@ -540,10 +600,61 @@ func writeEntryAssignment(w io.Writer, entry Entry) error {
 		return fmt.Errorf("couldn't encode entry assignment message type: %w", err)
 	}
 
-	assignment := assignmentFromEntry(int(createId), entry)
+	assignment := assignmentFromEntry(int(createID), entry)
 
 	if _, err := assignment.Encode(w); err != nil {
 		return fmt.Errorf("couldn't encode entry assignment: %w", err)
+	}
+
+	return nil
+}
+
+func writeEntryUpdate(w io.Writer, id int, seq int, value EntryValue) error {
+	if _, err := (&ntMessageType{Type: entryUpdateMessageType}).Encode(w); err != nil {
+		return fmt.Errorf("couldn't encode entry update message type: %w", err)
+	}
+
+	update := ntEntryUpdate{
+		ID:             uint16(id),
+		SequenceNumber: uint16(seq),
+		EntryValue:     ntFromEntryValue(value),
+	}
+
+	if _, err := update.Encode(w); err != nil {
+		return fmt.Errorf("couldn't encode entry value update: %w", err)
+	}
+
+	return nil
+}
+
+func writeDelete(w io.Writer, id int) error {
+	if _, err := (&ntMessageType{Type: entryDeleteMessageType}).Encode(w); err != nil {
+		return fmt.Errorf("couldn't encode entry delete message type: %w", err)
+	}
+
+	delete := ntEntryDelete{
+		ID: uint16(id),
+	}
+
+	if _, err := delete.Encode(w); err != nil {
+		return fmt.Errorf("couldn't encode delete: %w", err)
+	}
+
+	return nil
+}
+
+func writeEntryFlagsUpdate(w io.Writer, id int, opt EntryOptions) error {
+	if _, err := (&ntMessageType{Type: entryFlagsUpdateMessageType}).Encode(w); err != nil {
+		return fmt.Errorf("couldn't encode entry update message type: %w", err)
+	}
+
+	update := ntEntryFlagsUpdate{
+		ID:         uint16(id),
+		EntryFlags: ntFromEntryOptions(opt),
+	}
+
+	if _, err := update.Encode(w); err != nil {
+		return fmt.Errorf("couldn't encode entry flags update: %w", err)
 	}
 
 	return nil

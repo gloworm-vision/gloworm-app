@@ -1,10 +1,8 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"net/http"
-	"time"
+	"math"
 
 	"github.com/gloworm-vision/gloworm-app/networktables"
 	"github.com/sirupsen/logrus"
@@ -12,16 +10,25 @@ import (
 
 func main() {
 	client := networktables.Client{Logger: logrus.New()}
-
-	if err := client.Open(context.Background()); err != nil {
-		panic(err)
-	}
 	defer client.Close()
 
-	for i := 0.0; i < 100; i++ {
-		fmt.Println(client.Ping())
-		time.Sleep(time.Second)
-	}
+	client.Ping()
 
-	http.ListenAndServe(":8080", nil)
+	// fmt.Println(client.Create(networktables.Entry{
+	// 	Name: "x",
+	// 	Options: networktables.EntryOptions{
+	// 		Persist: true,
+	// 	},
+	// 	Value: networktables.EntryValue{
+	// 		EntryType: networktables.Double,
+	// 		Double:    3.14,
+	// 	},
+	// }))
+	client.UpdateValue("x", networktables.EntryValue{
+		EntryType: networktables.Double,
+		Double:    math.E,
+	})
+
+	fmt.Println(client.Get("x"))
+	fmt.Println(client.Get("x"))
 }

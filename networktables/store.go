@@ -9,36 +9,46 @@ import (
 	badger "github.com/dgraph-io/badger/v2"
 )
 
+// Store defines a minimal interface for a generic networktables store.
 type Store interface {
 	GetValue(id int) (e EntryValue, err error)
 	GetIDSeq(name string) (id int, seq int, err error)
 	GetNames() (names []string, err error)
 	GetByName(name string) (e Entry, err error)
 	Create(e Entry) error
-	UpdateValue(id int, ev EntryValue) error
-	UpdateSeq(id int, seq int) error
+	UpdateValue(id int, seq int, ev EntryValue) error
 	UpdateOptions(id int, opt EntryOptions) error
 	Delete(id int) error
 	DeleteByName(name string) (id int, err error)
 	Clear() error
 }
 
+// EntryType defines a networktables entry type.
 type EntryType int
 
 const (
+	// Boolean represents a boolean (true or false) entry type.
 	Boolean EntryType = iota
+	// Double represents a double (float64) entry type.
 	Double
+	// RawData represents a raw data (byte slice) entry type.
 	RawData
+	// String represents a string entry type.
 	String
+	// BooleanArray represents a boolean array (boolean slice) entry type.
 	BooleanArray
+	// DoubleArray represents a double array (float64 slice) entry type.
 	DoubleArray
+	// StringArray represents a string array entry type.
 	StringArray
 )
 
+// EntryOptions is the options (or flags) that an entry can be annotated with.
 type EntryOptions struct {
 	Persist bool
 }
 
+// Entry is an all-encompassing networktables entry.
 type Entry struct {
 	ID             int
 	SequenceNumber int
@@ -47,6 +57,8 @@ type Entry struct {
 	Value          EntryValue
 }
 
+// EntryValue represents a single networktables entry value. It only ever makes
+// sense for the entry types corresponding type to be set.
 type EntryValue struct {
 	EntryType EntryType
 
@@ -63,6 +75,7 @@ type badgerDB struct {
 	db *badger.DB
 }
 
+// OpenBadgerDB opens a badger DB with the given options as a networktables store.
 func OpenBadgerDB(options badger.Options) (Store, error) {
 	db, err := badger.Open(options)
 	if err != nil {
@@ -337,7 +350,7 @@ func (b *badgerDB) Create(entry Entry) error {
 		}
 
 		if err := tx.Set([]byte(strconv.Itoa(entry.ID)+badgerSeqSuffix), []byte(strconv.Itoa(entry.SequenceNumber))); err != nil {
-			return fmt.Errorf("couldn't set entry options: %w", err)
+			return fmt.Errorf("couldn't set entry sequence number: %w", err)
 		}
 
 		if err := tx.Set([]byte(badgerNamePrefix+entry.Name), []byte(strconv.Itoa(entry.ID))); err != nil {
@@ -357,7 +370,7 @@ func (b *badgerDB) Create(entry Entry) error {
 	return nil
 }
 
-func (b *badgerDB) UpdateValue(id int, ev EntryValue) error {
+func (b *badgerDB) UpdateValue(id int, seq int, ev EntryValue) error {
 	valueBuf := new(bytes.Buffer)
 	if err := gob.NewEncoder(valueBuf).Encode(ev); err != nil {
 		return fmt.Errorf("couldn't encode value to buffer with gob: %w", err)
@@ -366,6 +379,10 @@ func (b *badgerDB) UpdateValue(id int, ev EntryValue) error {
 	err := b.db.Update(func(tx *badger.Txn) error {
 		if err := tx.Set([]byte(strconv.Itoa(id)+badgerValueSuffix), valueBuf.Bytes()); err != nil {
 			return fmt.Errorf("couldn't set entry value: %w", err)
+		}
+
+		if err := tx.Set([]byte(strconv.Itoa(id)+badgerSeqSuffix), []byte(strconv.Itoa(seq))); err != nil {
+			return fmt.Errorf("couldn't set entry sequence number: %w", err)
 		}
 
 		return nil

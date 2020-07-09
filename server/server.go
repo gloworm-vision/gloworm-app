@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gloworm-vision/gloworm-app/hardware"
+	"github.com/gloworm-vision/gloworm-app/networktables"
 	"github.com/gloworm-vision/gloworm-app/pipeline"
 	"github.com/gloworm-vision/gloworm-app/store"
 	"github.com/hybridgroup/mjpeg"
@@ -23,6 +24,7 @@ type Server struct {
 	Store   store.Store
 	Capture *gocv.VideoCapture
 	Logger  *logrus.Logger
+	NT      networktables.Client
 
 	stream *mjpeg.Stream
 
@@ -89,8 +91,24 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 // init attempts to initialize the hardware manager and pipeline manager
-// with configs from the store
+// with configs from the store, and create all network tables entries
 func (s *Server) init() error {
+	err := s.NT.Create(networktables.Entry{
+		Name:  "/gloworm/x",
+		Value: networktables.EntryValue{EntryType: networktables.Double, Double: 0.0},
+	})
+	if err != nil {
+		return fmt.Errorf("unable to create networktables entry: %w", err)
+	}
+
+	err = s.NT.Create(networktables.Entry{
+		Name:  "/gloworm/y",
+		Value: networktables.EntryValue{EntryType: networktables.Double, Double: 0.0},
+	})
+	if err != nil {
+		return fmt.Errorf("unable to create networktables entry: %w", err)
+	}
+
 	s.hardwareManager = &hardwareManager{mu: new(sync.RWMutex)}
 
 	config, err := s.Store.HardwareConfig()
@@ -140,7 +158,11 @@ func (s *Server) runVision(ctx context.Context) error {
 				s.Logger.Debug("pipeline processing")
 				point, ok := pipeline.ProcessFrame(frameBuffer, &frameBuffer)
 
+				fmt.Println(s.NT.UpdateValue("/gloworm/x", networktables.EntryValue{EntryType: networktables.Double, Double: float64(point.X)}))
+				fmt.Println(s.NT.UpdateValue("/gloworm/y", networktables.EntryValue{EntryType: networktables.Double, Double: float64(point.Y)}))
+
 				s.Logger.Infof("point: %v, ok: %v", point, ok)
+
 			}
 
 			buf, err := gocv.IMEncode(".jpg", frameBuffer)
